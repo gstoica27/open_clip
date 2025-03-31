@@ -15,6 +15,9 @@ from torch import optim
 
 try:
     import wandb
+    with open('/weka/prior-default/georges/keys/wandb.txt', 'r') as f:
+        wandb_key = f.readlines()[0].strip()
+    wandb.login(key=wandb_key) # login to wandb
 except ImportError:
     wandb = None
 
