@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import warnings
 import braceexpand
 from dataclasses import dataclass
 from multiprocessing import Value
@@ -15,15 +16,21 @@ import torch
 import torchvision.datasets as datasets
 import webdataset as wds
 from PIL import Image
+from datasets import load_from_disk
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableDataset, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander, valid_sample
+import PIL
+import nltk
+from PIL import ImageFile, ImageOps
+nltk.download('punkt_tab')
 
-try:
-    import horovod.torch as hvd
-except ImportError:
-    hvd = None
+
+# try:
+#     import horovod.torch as hvd
+# except ImportError:
+#     hvd = None
 
 
 class CsvDataset(Dataset):
@@ -523,6 +530,78 @@ def get_synthetic_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None
     return DataInfo(dataloader, sampler)
 
 
+def setup_pil():
+    PIL.Image.MAX_IMAGE_PIXELS = None
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def load_image_from_path(image_path):
+    setup_pil()  # Call here so the setting is applied in multi-processing contexts
+    if isinstance(image_path, PIL.Image.Image):
+        # Avoid annoying palette transparency warnings filling up the logs
+        if image_path.mode == "P":
+            image_path = image_path.convert("RGBA")
+        with warnings.catch_warnings(record=True) as w:
+            image = image_path.convert("RGB")
+        image = image_path
+        try:
+            image = ImageOps.exif_transpose(image)
+        except Exception as e:
+            pass
+        # return np.array(image)
+        return image
+    elif isinstance(image_path, np.ndarray):
+        assert len(image_path.shape) == 3, "Image should have 3 dimensions"
+        assert image_path.shape[2] == 3, "Image should have 3 channels"
+        assert image_path.dtype == np.uint8, "Image should have uint8 type"
+        return image_path
+    else:
+        with PIL.Image.open(image_path) as image:
+            return load_image_from_path(image)
+        
+
+class HFDataset(torch.utils.data.Dataset):
+    def __init__(self, args, image_preprocessor, is_train=True, tokenizer=None):
+        path = args.train_data if is_train else args.val_data
+        self.dataset = load_from_disk(path)
+        self.visual_processor = image_preprocessor
+        self.text_processor = tokenizer
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        example = self.dataset[idx]
+        
+        image = load_image_from_path(example["image"])
+        caption = example["caption"]
+        sentences = nltk.sent_tokenize(caption)
+        rng_idx = np.random.randint(0, len(sentences))
+        label = sentences[rng_idx]
+        
+        return self.visual_processor(image), self.text_processor(label)[0]
+
+def get_hf_dataset(args, preprocess_fn, is_train=True, epoch=0, tokenizer=None):
+    dataset = HFDataset(args, preprocess_fn, is_train=is_train, tokenizer=tokenizer)
+    num_samples = len(dataset)
+    sampler = DistributedSampler(dataset) if args.distributed and is_train else None
+    shuffle = is_train and sampler is None
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=is_train,
+    )
+    dataloader.num_samples = num_samples
+    dataloader.num_batches = len(dataloader)
+
+    return DataInfo(dataloader, sampler)
+
+
 def get_dataset_fn(data_path, dataset_type):
     if dataset_type == "webdataset":
         return get_wds_dataset
@@ -539,6 +618,8 @@ def get_dataset_fn(data_path, dataset_type):
         else:
             raise ValueError(
                 f"Tried to figure out dataset type, but failed for extension {ext}.")
+    elif dataset_type == "hf":
+        return get_hf_dataset
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
     
