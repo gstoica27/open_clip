@@ -24,7 +24,7 @@ from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander
 import PIL
 import nltk
 from PIL import ImageFile, ImageOps
-nltk.download('punkt_tab')
+nltk.download('punkt_tab', force=True)
 
 
 # try:
