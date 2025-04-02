@@ -26,9 +26,9 @@ import nltk
 from PIL import ImageFile, ImageOps
 import shutil
 # remove the nltk punkt tokenizer if it exists in the environment, to avoid unnecessary downloads
-if os.path.exists("punkt_tab"):
-    shutil.rmtree("punkt_tab", ignore_errors=True)  # remove the nltk data dir if it exists to avoid conflicts
-nltk.download('punkt_tab', force=True)
+# if os.path.exists("punkt_tab"):
+#     shutil.rmtree("punkt_tab", ignore_errors=True)  # remove the nltk data dir if it exists to avoid conflicts
+nltk.download('punkt_tab', force=True, download_dir="/weka/oe-training-default/georges/nltk_data")
 
 
 # try:
