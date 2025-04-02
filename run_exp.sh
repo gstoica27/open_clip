@@ -14,10 +14,10 @@ torchrun --nproc_per_node 8 \
     --imagenet-val "/weka/prior-default/georges/datasets/imagenet1k/imagenet/val" \
     --model "ViT-L-14-quickgelu" \
     --pretrained "metaclip_fullcc" \
-    --lr 5e-6 \
+    --lr 1e-5 \
     --wd 0.1 \
-    --wandb-project-name metaclip-fullcc-pixmocap-ft \
+    --warmup 1e3 \
+    --accum-freq 64 \
     --report-to wandb \
-    --warmup 2e3 \
-    --accum-freq 64
+    --wandb-project-name metaclip-fullcc-pixmocap-ft
     # --logs /weka/oe_training_default/georges/checkpoints/finetuned_models/metaclip_400m/logs \
