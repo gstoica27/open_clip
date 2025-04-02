@@ -1,8 +1,8 @@
-torch>=1.9.0
-torchvision
-regex
-ftfy
-tqdm
-huggingface_hub
-safetensors
-timm
+# torch>=1.9.0
+# torchvision
+# regex
+# ftfy
+# tqdm
+# huggingface_hub
+# safetensors
+# timm
