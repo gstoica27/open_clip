@@ -16,7 +16,7 @@ torchrun --nproc_per_node 8 \
     --pretrained "metaclip_fullcc" \
     --lr 1e-5 \
     --wd 0.1 \
-    --warmup 1e3 \
+    --warmup 1000 \
     --accum-freq 64 \
     --report-to wandb \
     --wandb-project-name metaclip-fullcc-pixmocap-ft
