@@ -28,8 +28,15 @@ import shutil
 # remove the nltk punkt tokenizer if it exists in the environment, to avoid unnecessary downloads
 # if os.path.exists("punkt_tab"):
 #     shutil.rmtree("punkt_tab", ignore_errors=True)  # remove the nltk data dir if it exists to avoid conflicts
-nltk.download('punkt_tab', force=True, download_dir="/weka/oe-training-default/georges/nltk_data")
-
+flag = True
+while flag:
+    try:
+        nltk.download('punkt_tab', force=True, download_dir="/root")
+        flag = False
+    except:
+        if os.path.exists("/root/nltk_data"):
+            shutil.rmtree("/root/nltk_data", ignore_errors=True)  # remove the nltk data dir if it exists to avoid conflicts
+    
 
 # try:
 #     import horovod.torch as hvd
