@@ -31,7 +31,7 @@ import shutil
 flag = True
 while flag:
     try:
-        nltk.download('punkt_tab', force=True, download_dir="/root")
+        nltk.download('punkt_tab', force=True)  
         flag = False
     except:
         if os.path.exists("/root/nltk_data"):
