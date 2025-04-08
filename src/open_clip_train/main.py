@@ -484,11 +484,10 @@ def main(args):
             logging.info(f'Start epoch {epoch}')
         # Evaluate first
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            evaluate(model, data, epoch, args, tb_writer=writer, tokenizer=tokenizer)
         # Train epoch
         train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
-
 
         # Saving checkpoints.
         if args.save_logs:
@@ -519,6 +518,10 @@ def main(args):
                 latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
                 torch.save(checkpoint_dict, tmp_save_path)
                 os.replace(tmp_save_path, latest_save_path)
+    
+    # Evaluate at end of training
+    if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
+        evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)        
 
     if args.wandb and is_master(args):
         wandb.finish()
