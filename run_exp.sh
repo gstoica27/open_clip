@@ -19,5 +19,6 @@ torchrun --nproc_per_node 8 \
     --warmup 1000 \
     --accum-freq 8 \
     --report-to wandb \
-    --wandb-project-name metaclip-fullcc-pixmocap-ft
+    --wandb-project-name metaclip-fullcc-pixmocap-ft \
+    --eval-knn
     # --logs /weka/oe_training_default/georges/checkpoints/finetuned_models/metaclip_400m/logs \
