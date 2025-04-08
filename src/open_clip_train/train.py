@@ -399,7 +399,7 @@ def maybe_compute_generative_loss(model_out):
 class SingleOutputModel(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.model = model
+        self.model = model.module
 
     def forward(self, samples):
         if self.model.output_dict:
