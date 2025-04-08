@@ -17,7 +17,7 @@ torchrun --nproc_per_node 8 \
     --lr 1e-5 \
     --wd 0.1 \
     --warmup 1000 \
-    --accum-freq 32 \
+    --accum-freq 64 \
     --report-to wandb \
     --wandb-project-name metaclip-fullcc-pixmocap-ft
     # --eval-knn
