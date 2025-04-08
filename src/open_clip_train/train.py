@@ -1,3 +1,4 @@
+import pdb
 import json
 import logging
 import math
@@ -6,9 +7,11 @@ import time
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel
-
+from torch.utils.data import Dataset
+from tqdm import tqdm
 try:
     import wandb
 except ImportError:
@@ -19,6 +22,12 @@ from open_clip_train.distributed import is_master
 from open_clip_train.zero_shot import zero_shot_eval
 from open_clip_train.precision import get_autocast
 
+from typing import Any, Tuple, Dict, Optional, Union
+from torch.nn.functional import one_hot, softmax
+from functools import partial
+from torchmetrics import Metric, MetricCollection
+from torchmetrics.classification import MulticlassAccuracy
+from enum import Enum
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -382,3 +391,458 @@ def maybe_compute_generative_loss(model_out):
         token_logits = model_out["logits"]
         token_labels = model_out["labels"]
         return F.cross_entropy(token_logits.permute(0, 2, 1), token_labels)
+
+
+# --------------------------------- KNN Eval ---------------------------------
+
+
+class SingleOutputModel(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, samples):
+        if self.model.output_dict:
+            return self.model(samples)["image_features"]
+        else:
+            return self.model(samples)[0]
+
+
+class AccuracyAveraging(Enum):
+    MEAN_ACCURACY = "micro"
+    MEAN_PER_CLASS_ACCURACY = "macro"
+    PER_CLASS_ACCURACY = "none"
+
+    def __str__(self):
+        return self.value
+    
+
+def build_topk_accuracy_metric(average_type: AccuracyAveraging, num_classes: int, ks: tuple = (1, 5)):
+    metrics: Dict[str, Metric] = {
+        f"top-{k}": MulticlassAccuracy(top_k=k, num_classes=int(num_classes), average=average_type.value) for k in ks
+    }
+    return MetricCollection(metrics)
+
+
+class DictKeysModule(torch.nn.Module):
+    def __init__(self, keys):
+        super().__init__()
+        self.keys = keys
+
+    def forward(self, features_dict, targets):
+        for k in self.keys:
+            features_dict = features_dict[k]
+        return {"preds": features_dict, "target": targets}
+
+
+class DatasetWithEnumeratedTargets(Dataset):
+    def __init__(self, dataset):
+        self._dataset = dataset
+
+    def get_image_data(self, index: int) -> bytes:
+        return self._dataset.get_image_data(index)
+
+    def get_target(self, index: int) -> Tuple[Any, int]:
+        target = self._dataset.get_target(index)
+        return (index, target)
+
+    def __getitem__(self, index: int) -> Tuple[Any, Tuple[Any, int]]:
+        # try:
+        image, target = self._dataset[index]
+        target = index if target is None else target
+        return image, (index, target)
+        # except:
+        #     return None, (None, None)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+    
+
+class KnnModule(torch.nn.Module):
+    """
+    Gets knn of test features from all processes on a chunk of the train features
+
+    Each rank gets a chunk of the train features as well as a chunk of the test features.
+    In `compute_neighbors`, for each rank one after the other, its chunk of test features
+    is sent to all devices, partial knns are computed with each chunk of train features
+    then collated back on the original device.
+    """
+
+    def __init__(self, train_features, train_labels, nb_knn, T, device, num_classes=1000):
+        super().__init__()
+
+        self.device = device
+        self.train_features_rank_T = train_features.T.to(self.device)
+        self.candidates = train_labels.view(1, -1).to(self.device)
+
+        self.nb_knn = nb_knn
+        self.max_k = max(self.nb_knn)
+        self.T = T
+        self.num_classes = num_classes
+
+    def _get_knn_sims_and_labels(self, similarity, train_labels):
+        topk_sims, indices = similarity.topk(self.max_k, largest=True, sorted=True)
+        neighbors_labels = torch.gather(train_labels, 1, indices)
+        return topk_sims, neighbors_labels
+
+    def _similarity_for_rank(self, features_rank, source_rank):
+        # Send the features from `source_rank` to all ranks
+        broadcast_shape = torch.tensor(features_rank.shape).to(self.device)
+        # torch.distributed.broadcast(broadcast_shape, source_rank)
+
+        broadcasted = features_rank
+        # if self.global_rank != source_rank:
+        # broadcasted = torch.zeros(*broadcast_shape, dtype=features_rank.dtype, device=self.device)
+        # torch.distributed.broadcast(broadcasted, source_rank)
+
+        # Compute the neighbors for `source_rank` among `train_features_rank_T`
+        similarity_rank = torch.mm(broadcasted, self.train_features_rank_T)
+        candidate_labels = self.candidates.expand(len(similarity_rank), -1)
+        return self._get_knn_sims_and_labels(similarity_rank, candidate_labels)
+
+    def _gather_all_knn_for_rank(self, topk_sims, neighbors_labels, target_rank):
+        # Gather all neighbors for `target_rank`
+        topk_sims_rank = retrieved_rank = None
+        # if self.global_rank == target_rank:
+        topk_sims_rank = [torch.zeros_like(topk_sims) for _ in range(1)]
+        retrieved_rank = [torch.zeros_like(neighbors_labels) for _ in range(1)]
+        # pdb.set_trace()
+        # torch.distributed.gather(topk_sims, topk_sims_rank, dst=target_rank)
+        # torch.distributed.gather(neighbors_labels, retrieved_rank, dst=target_rank)
+        for i in range(len(topk_sims_rank)):
+            topk_sims_rank[i] = topk_sims
+            retrieved_rank[i] = neighbors_labels
+
+        # if self.global_rank == target_rank:
+        # Perform a second top-k on the k * global_size retrieved neighbors
+        topk_sims_rank = torch.cat(topk_sims_rank, dim=1)
+        retrieved_rank = torch.cat(retrieved_rank, dim=1)
+        results = self._get_knn_sims_and_labels(topk_sims_rank, retrieved_rank)
+        return results
+        # return None
+
+    def compute_neighbors(self, features_rank):
+        for rank in range(1):
+            topk_sims, neighbors_labels = self._similarity_for_rank(features_rank, rank)
+            results = self._gather_all_knn_for_rank(topk_sims, neighbors_labels, rank)
+            if results is not None:
+                topk_sims_rank, neighbors_labels_rank = results
+        return topk_sims_rank, neighbors_labels_rank
+
+    def forward(self, features_rank):
+        """
+        Compute the results on all values of `self.nb_knn` neighbors from the full `self.max_k`
+        """
+        assert all(k <= self.max_k for k in self.nb_knn)
+
+        topk_sims, neighbors_labels = self.compute_neighbors(features_rank)
+        batch_size = neighbors_labels.shape[0]
+        topk_sims_transform = softmax(topk_sims / self.T, 1)
+        matmul = torch.mul(
+            one_hot(neighbors_labels, num_classes=self.num_classes),
+            topk_sims_transform.view(batch_size, -1, 1),
+        )
+        probas_for_k = {k: torch.sum(matmul[:, :k, :], 1) for k in self.nb_knn}
+        return probas_for_k
+    
+
+@torch.inference_mode()
+def extract_features_with_dataloader(model, data_loader, sample_count, gather_on_cpu=False, loc=None):
+    gather_device = torch.device("cpu") if gather_on_cpu else torch.device("cuda")
+    features, all_labels = None, None
+    for samples, (index, labels_rank) in tqdm(data_loader, desc="Extracting features"):
+        samples = samples.to('cuda')
+        labels_rank = labels_rank.to('cuda')
+        index = index.to('cuda')
+        # if model.output_dict:
+        #     features_rank = model(samples)['image_features'].float()
+        # else:
+        #     features_rank = model(samples)[0].float()
+        features_rank = model(samples).float()
+
+        # init storage feature matrix
+        if features is None:
+            features = torch.zeros(sample_count, features_rank.shape[-1], device=gather_device)
+            labels_shape = list(labels_rank.shape)
+            labels_shape[0] = sample_count
+            all_labels = torch.full(labels_shape, fill_value=-1, device=gather_device)
+            print(f"Storing features into tensor of shape {features.shape}")
+
+        # share indexes, features and labels between processes
+        index_all = index.to(gather_device)
+        features_all_ranks = features_rank.to(gather_device)
+        labels_all_ranks = labels_rank.to(gather_device)
+
+        # update storage feature matrix
+        if len(index_all) > 0:
+            features.index_copy_(0, index_all, features_all_ranks)
+            all_labels.index_copy_(0, index_all, labels_all_ranks)
+            
+    print(f"Features shape: {tuple(features.shape)}")
+    print(f"Labels shape: {tuple(all_labels.shape)}")
+    
+    assert torch.all(all_labels > -1)
+    
+    if loc is not None:
+        torch.save({'train_features': features, 'train_labels': all_labels}, loc)
+
+    return features, all_labels
+
+
+def extract_features(model, dataloader, gather_on_cpu=False, loc=None):
+    dataset_with_enumerated_targets = DatasetWithEnumeratedTargets(dataloader.dataset)
+    sample_count = len(dataset_with_enumerated_targets)
+    data_loader = torch.utils.data.DataLoader(
+            dataset_with_enumerated_targets,
+            batch_size=dataloader.batch_size,
+            num_workers=dataloader.num_workers
+        )
+    return extract_features_with_dataloader(model, data_loader, sample_count, gather_on_cpu, loc=loc)
+
+
+def create_class_indices_mapping(labels):
+    unique_labels, inverse = torch.unique(labels, return_inverse=True)
+    mapping = {unique_labels[i]: (inverse == i).nonzero() for i in range(len(unique_labels))}
+    return mapping
+
+class ModuleDictWithForward(torch.nn.ModuleDict):
+    def forward(self, *args, **kwargs):
+        return {k: module(*args, **kwargs) for k, module in self._modules.items()}
+
+
+def filter_train(mapping, n_per_class, seed):
+    torch.manual_seed(seed)
+    final_indices = []
+    for k in mapping.keys():
+        index = torch.randperm(len(mapping[k]))[:n_per_class]
+        final_indices.append(mapping[k][index])
+    return torch.cat(final_indices).squeeze()
+
+
+def create_module_dict(*, module, n_per_class_list, n_tries, nb_knn, train_features, train_labels):
+    modules = {}
+    mapping = create_class_indices_mapping(train_labels)
+    for npc in n_per_class_list:
+        if npc < 0:  # Only one try needed when using the full data
+            full_module = module(
+                train_features=train_features,
+                train_labels=train_labels,
+                nb_knn=nb_knn,
+            )
+            modules["full"] = ModuleDictWithForward({"1": full_module})
+            continue
+        all_tries = {}
+        for t in range(n_tries):
+            final_indices = filter_train(mapping, npc, seed=t)
+            k_list = list(set(nb_knn + [npc]))
+            k_list = sorted([el for el in k_list if el <= npc])
+            all_tries[str(t)] = module(
+                train_features=train_features[final_indices],
+                train_labels=train_labels[final_indices],
+                nb_knn=k_list,
+            )
+        modules[f"{npc} per class"] = ModuleDictWithForward(all_tries)
+
+    return ModuleDictWithForward(modules)
+
+
+@torch.inference_mode()
+def knn_evaluate(
+    model: nn.Module,
+    data_loader,
+    postprocessors: Dict[str, nn.Module],
+    metrics: Dict[str, MetricCollection],
+    device: torch.device,
+    criterion: Optional[nn.Module] = None,
+):
+    model.eval()
+    if criterion is not None:
+        criterion.eval()
+
+    for metric in metrics.values():
+        metric = metric.to(device)
+
+    # metric_logger = MetricLogger(delimiter="  ")
+    # header = "Test:"
+
+    for samples, targets, *_ in tqdm(data_loader, desc='evaluating the Dataset with Knn'):
+        # pdb.set_trace()
+        outputs = model(samples.to(device))
+        targets = targets.to(device)
+
+        if criterion is not None:
+            loss = criterion(outputs, targets)
+            # metric_logger.update(loss=loss.item())
+
+        for k, metric in metrics.items():
+            metric_inputs = postprocessors[k](outputs, targets)
+            metric.update(**metric_inputs)
+
+    # metric_logger.synchronize_between_processes()
+    # print(f"Averaged stats: {metric_logger}")
+
+    stats = {k: metric.compute() for k, metric in metrics.items()}
+    # metric_logger_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    # return metric_logger_stats, stats
+    return stats
+
+
+def zeroshot_eval_knn_model(
+        model, train_loader, eval_loader, device=None, 
+        gather_on_cpu=False, loc=None, use_existing_encs=True,
+        nb_knn=(10, 20, 100, 200)
+    ):
+    """Evaluate a model with Knn on a dataset"""
+    if loc is not None and os.path.exists(loc) and use_existing_encs:
+        _ = torch.load(loc)
+        train_features, train_labels = _['train_features'], _['train_labels']
+    else:
+        train_features, train_labels = extract_features(model, train_loader, gather_on_cpu=gather_on_cpu, loc=loc)
+    # train_features = torch.nn.functional.normalize(train_features, dim=1, p=2)
+    print("Train features are shape: ", train_features.shape)
+    print("Train labels are shape: ", train_labels.shape)
+    # logging.info("Train features are shape: ", train_features.shape)
+    # logging.info("Train labels are shape: ", train_labels.shape)
+    # pdb.set_trace()
+    num_classes = train_labels.max() + 1
+    metric_collection = build_topk_accuracy_metric(AccuracyAveraging.MEAN_ACCURACY, num_classes=num_classes)
+    device = torch.cuda.current_device()
+    partial_module = partial(KnnModule, T=.07, device=device, num_classes=num_classes)
+    knn_module_dict = create_module_dict(
+        module=partial_module,
+        n_per_class_list=[-1],
+        n_tries=1,
+        nb_knn=nb_knn,
+        train_features=train_features,
+        train_labels=train_labels,
+    )
+    # pdb.set_trace()
+    postprocessors, metrics = {}, {}
+    for n_per_class, knn_module in knn_module_dict.items():
+        for t, knn_try in knn_module.items():
+            postprocessors = {
+                **postprocessors,
+                **{(n_per_class, t, k): DictKeysModule([n_per_class, t, k]) for k in knn_try.nb_knn},
+            }
+            metrics = {**metrics, **{(n_per_class, t, k): metric_collection.clone() for k in knn_try.nb_knn}}
+    # pdb.set_trace()
+    model_with_knn = torch.nn.Sequential(model, knn_module_dict)
+    # print("Start the k-NN classification.")
+    logging.info("Start the k-NN classification.")
+    results_dict = knn_evaluate(model_with_knn, eval_loader, postprocessors, metrics, device)
+    # Averaging the results over the n tries for each value of n_per_class
+    for n_per_class, knn_module in knn_module_dict.items():
+        first_try = list(knn_module.keys())[0]
+        k_list = knn_module[first_try].nb_knn
+        for k in k_list:
+            keys = results_dict[(n_per_class, first_try, k)].keys()  # keys are e.g. `top-1` and `top-5`
+            results_dict[(n_per_class, k)] = {
+                key: torch.mean(torch.stack([results_dict[(n_per_class, t, k)][key] for t in knn_module.keys()]))
+                for key in keys
+            }
+            for t in knn_module.keys():
+                del results_dict[(n_per_class, t, k)]
+    results_dict_knn = {}
+    for knn_ in results_dict.keys():
+        top1 = results_dict[knn_]["top-1"].item() * 100.0
+        top5 = results_dict[knn_]["top-5"].item() * 100.0
+        results_dict_knn[f"{knn_} Top 1"] = top1
+        results_dict_knn[f"{knn_} Top 5"] = top5
+        # print(f"{knn_} classifier result: Top1: {top1:.2f} Top5: {top5:.2f}")
+        logging.info(f"{knn_} classifier result: Top1: {top1:.2f} Top5: {top5:.2f}")
+    
+    return_dict = {}
+    for (_, nn) in results_dict.keys():
+        for key, val in results_dict[(_, nn)].items():
+            if key not in return_dict:
+                new_key = f"NN-{nn}-{key}"
+                return_dict[new_key] = val.item()
+
+    return return_dict
+
+
+def build_dataloaders(data_config, device='cuda'):
+    """ Load all dataloaders required for experiment. """
+    if isinstance(data_config, list):
+        return [build_dataloaders(c, device) for c in data_config]
+    
+    data_config['device'] = device
+    
+    if data_config['name'] == 'eurosat':
+        from open_clip_train.eval_datasets.eurosat import prepare_train_loaders, prepare_test_loaders
+    elif data_config['name'] == 'dtd':
+        from open_clip_train.eval_datasets.dtd import prepare_train_loaders, prepare_test_loaders
+    elif data_config['name'] == 'sun397':
+        from open_clip_train.eval_datasets.sun397 import prepare_train_loaders, prepare_test_loaders
+    elif data_config['name'] == 'resisc45':
+        from open_clip_train.eval_datasets.resisc45 import prepare_train_loaders, prepare_test_loaders
+    elif data_config['name'] == 'pets':
+        from open_clip_train.eval_datasets.pets import prepare_train_loaders, prepare_test_loaders
+    elif data_config['name'] == 'flowers':
+        from open_clip_train.eval_datasets.flowers import prepare_train_loaders, prepare_test_loaders
+    elif data_config['name'] == 'food':
+        from open_clip_train.eval_datasets.food import prepare_train_loaders, prepare_test_loaders
+    elif data_config['name'] == 'cars':
+        from open_clip_train.eval_datasets.cars import prepare_train_loaders, prepare_test_loaders
+    # elif data_config['name'] == 'mnist':
+    #     from eval_datasets.mnist import prepare_train_loaders, prepare_test_loaders
+    # elif data_config['name'] == 'gtsrb':
+    #     from eval_datasets.gtsrb import prepare_train_loaders, prepare_test_loaders
+    # elif data_config['name'] == 'svhn':
+    #     from eval_datasets.svhn import prepare_train_loaders, prepare_test_loaders
+    # elif data_config['name'] == 'imagenet':
+    #     from eval_datasets.imagenet import prepare_train_loaders, prepare_test_loaders
+    # elif data_config['name'] == 'cc3m':
+    #     from eval_datasets.cc3m import prepare_train_loaders, prepare_test_loaders
+    else:
+        raise NotImplementedError(data_config['name'])
+    
+    train_loaders = prepare_train_loaders(data_config)
+    test_loaders = prepare_test_loaders(data_config)
+    try:
+        return {
+            'name': data_config['name'],
+            'train': train_loaders,
+            'test': test_loaders
+        }
+    except:
+        import pdb; pdb.set_trace()
+
+
+def run_knn_evals(model, args, tb_writer, preprocessor, epoch, step):
+    knn_model = SingleOutputModel(model)
+    datasets_to_eval = ['eurosat', 'cars', 'resisc45', 'pets', 'food', 'flowers', 'dtd']
+    all_dataloaders = build_dataloaders(
+        [
+            {
+                "name": name,
+                "batch_size": 128,
+                "num_workers": 4,
+                "train_preprocess": preprocessor,
+                "eval_preprocess": preprocessor
+            } for name in datasets_to_eval
+        ]
+    )
+    all_metrics = {"epoch": epoch}
+    for name, train_test_loaders in zip(datasets_to_eval, all_dataloaders):
+        train_loader = train_test_loaders['train']['full']
+        test_loader = train_test_loaders['test']['test']
+
+        knn_results = zeroshot_eval_knn_model(knn_model, train_loader, test_loader)
+
+        for key, val in knn_results.items():
+            all_metrics[f"knn_val/{name}/{key}"] = val
+
+    if args.save_logs:
+        if tb_writer is not None:
+            for name, val in all_metrics.items():
+                tb_writer.add_scalar(name, val, epoch)
+
+        with open(os.path.join(args.checkpoint_path, "knn_results.jsonl"), "a+") as f:
+            f.write(json.dumps(all_metrics))
+            f.write("\n")
+
+    if args.wandb:
+        assert wandb is not None, 'Please install wandb.'
+        # log_data['epoch'] = epoch
+        wandb.log(all_metrics, step=step)

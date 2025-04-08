@@ -83,7 +83,7 @@ def prepare_test_loaders(config):
         # ),
         'class_names': classnames
     }
-    from dataset_parsers.label_checks import verify_labels
+    from open_clip_train.eval_datasets.label_checks import verify_labels
     if not verify_labels('dtd', loaders['class_names']):
         pdb.set_trace
     

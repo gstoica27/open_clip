@@ -87,7 +87,7 @@ def prepare_test_loaders(config):
             num_workers=config['num_workers']
         )
     loaders['class_names'] = dataset_class.classnames
-    from dataset_parsers.label_checks import verify_labels
+    from open_clip_train.eval_datasets.label_checks import verify_labels
     if not verify_labels('sun397', loaders['class_names']):
         pdb.set_trace
         

@@ -110,7 +110,8 @@ def parse_args(args):
     parser.add_argument(
         "--logs",
         type=str,
-        default="./logs/",
+        # default="./logs/",
+        default="/weka/oe-training-default/georges/checkpoints/MetaCLIP_FT/logs/",
         help="Where to store tensorboard logs. Use None to avoid storing logs.",
     )
     parser.add_argument(
@@ -474,6 +475,12 @@ def parse_args(args):
         default=None,
         type=str,
         help='A string to specify a specific distributed loss implementation.'
+    )
+    parser.add_argument(
+        "--eval-knn",
+        default=False,
+        action="store_true",
+        help='Evaluate the model using KNN.'
     )
 
     args = parser.parse_args(args)

@@ -41,7 +41,7 @@ def prepare_test_loaders(config):
         )
     }
     loaders['class_names'] = [' '.join(i.split('_')) for i in test_set.classes]
-    from dataset_parsers.label_checks import verify_labels
+    from open_clip_train.eval_datasets.label_checks import verify_labels
     if not verify_labels('food', loaders['class_names']):
         pdb.set_trace
     # pdb.set_trace()

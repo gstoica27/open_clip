@@ -327,7 +327,7 @@ def prepare_test_loaders(config):
         ),
     }
     loaders['class_names'] = [' '.join(c.split('_')) for c in RESISC45.classes]
-    from dataset_parsers.label_checks import verify_labels
+    from open_clip_train.eval_datasets.label_checks import verify_labels
     if not verify_labels('resisc45', loaders['class_names']):
         pdb.set_trace
     

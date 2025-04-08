@@ -37,7 +37,7 @@ from open_clip_train.distributed import is_master, init_distributed_device, broa
 from open_clip_train.logger import setup_logging
 from open_clip_train.params import parse_args
 from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
-from open_clip_train.train import train_one_epoch, evaluate
+from open_clip_train.train import train_one_epoch, evaluate, run_knn_evals
 from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 
 
@@ -485,6 +485,10 @@ def main(args):
         # Evaluate first
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
             evaluate(model, data, epoch, args, tb_writer=writer, tokenizer=tokenizer)
+        # Eval KNN
+        if args.eval_knn:
+            step = (data['train'].dataloader.num_batches // args.accum_freq) * epoch
+            run_knn_evals(model, args, tb_writer=writer, preprocessor=preprocess_val, epoch=epoch, step=step)
         # Train epoch
         train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
@@ -521,7 +525,10 @@ def main(args):
     
     # Evaluate at end of training
     if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-        evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)        
+        evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)       
+    if args.eval_knn:
+        step = (data['train'].dataloader.num_batches // args.accum_freq) * epoch
+        run_knn_evals(model, args, tb_writer=writer, preprocessor=preprocess_val, epoch=completed_epoch, step=step)
 
     if args.wandb and is_master(args):
         wandb.finish()

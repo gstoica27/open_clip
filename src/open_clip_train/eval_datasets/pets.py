@@ -133,7 +133,7 @@ def prepare_test_loaders(config):
     }
     loaders['class_names'] = test_set.classnames
     
-    from dataset_parsers.label_checks import verify_labels
+    from open_clip_train.eval_datasets.label_checks import verify_labels
     if not verify_labels('pets', loaders['class_names']):
         pdb.set_trace
     return loaders
